@@ -311,19 +311,40 @@ async function readPositions(provider, account, npm) {
 
 // ─── Staked positions ─────────────────────────────────────────────────────────
 
+// Queries event logs in chunks to work around RPC block-range limits (typically 10,000).
+async function queryFilterChunked(contract, filter, fromBlock, toBlock, chunkSize = 9000) {
+  const events = [];
+  for (let start = fromBlock; start <= toBlock; start += chunkSize) {
+    const end = Math.min(start + chunkSize - 1, toBlock);
+    const chunk = await contract.queryFilter(filter, start, end);
+    events.push(...chunk);
+  }
+  return events;
+}
+
 // Staked NFTs are owned by the gauge contract, not the user's address.
 // Strategy: find all tokenIds ever sent FROM the account via NPM Transfer events,
 // then check current ownership — tokens still held by another address are staked/deposited.
 async function checkStakedPositions(provider, account, npm) {
   console.log("\n=== Staked Positions ===");
 
-  // All transfers FROM this account
+  let latestBlock;
+  try {
+    latestBlock = await provider.getBlockNumber();
+  } catch (err) {
+    console.log(`  Warning: could not get block number: ${err.message}`);
+    return;
+  }
+
+  // All transfers FROM this account, paginated in 9,000-block chunks
   let sentEvents;
   try {
     const filter = npm.filters.Transfer(account);
-    sentEvents = await npm.queryFilter(filter, 0, "latest");
+    process.stdout.write(`  Scanning ${latestBlock.toLocaleString()} blocks for transfers...`);
+    sentEvents = await queryFilterChunked(npm, filter, 0, latestBlock);
+    console.log(` found ${sentEvents.length} transfer(s).`);
   } catch (err) {
-    console.log(`  Warning: could not query Transfer events: ${err.message}`);
+    console.log(`\n  Warning: could not query Transfer events: ${err.message}`);
     return;
   }
 
