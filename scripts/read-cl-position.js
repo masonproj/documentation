@@ -23,18 +23,9 @@ const RPCS = [
   "https://mezo.drpc.org",
 ];
 
-const NPM_ADDRESS    = "0x509Bc221df2B83927c695FA0bb0f5B21053C874c";
-const FACTORY_ADDRESS       = "0xBB24AF5c6fB88F1d191FA76055e30BF881BeEb79";
-const GAUGE_FACTORY_ADDRESS = "0xfc41E1AAe0e58E8bDC32e85d8C995A902FEdEb13";
-
-// Known CL pools to scan for staked positions: [token0, token1, tickSpacing]
-const KNOWN_CL_POOLS = [
-  {
-    token0: "0x7b7C000000000000000000000000000000000000", // BTC
-    token1: "0xdD468A1DDc392dcdbEf6db6e34E89AA338F9F186", // MUSD
-    tickSpacing: 200,
-  },
-];
+const NPM_ADDRESS     = "0x509Bc221df2B83927c695FA0bb0f5B21053C874c";
+const FACTORY_ADDRESS = "0xBB24AF5c6fB88F1d191FA76055e30BF881BeEb79";
+const EXPLORER_API    = "https://explorer.mezo.org/api";
 
 const FEE_FROM_TICK_SPACING = {
   1: "0.01%", 10: "0.05%", 50: "0.05%",
@@ -51,7 +42,6 @@ const NPM_ABI = [
   "function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)",
   "function ownerOf(uint256 tokenId) view returns (address)",
   "function positions(uint256 tokenId) view returns (uint96 nonce, address operator, address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)",
-  "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
 ];
 
 const FACTORY_ABI = [
@@ -67,15 +57,6 @@ const POOL_ABI = [
 const ERC20_ABI = [
   "function symbol() view returns (string)",
   "function decimals() view returns (uint8)",
-];
-
-const GAUGE_FACTORY_ABI = [
-  "function getGauge(address pool) view returns (address gauge)",
-];
-
-// Velodrome Slipstream gauge emits Deposit when a position NFT is staked.
-const GAUGE_ABI = [
-  "event Deposit(address indexed depositor, uint256 indexed tokenId)",
 ];
 
 // ─── Provider ─────────────────────────────────────────────────────────────────
@@ -311,50 +292,51 @@ async function readPositions(provider, account, npm) {
 
 // ─── Staked positions ─────────────────────────────────────────────────────────
 
-// Queries event logs in chunks to work around RPC block-range limits (typically 10,000).
-async function queryFilterChunked(contract, filter, fromBlock, toBlock, chunkSize = 9000) {
-  const events = [];
-  for (let start = fromBlock; start <= toBlock; start += chunkSize) {
-    const end = Math.min(start + chunkSize - 1, toBlock);
-    const chunk = await contract.queryFilter(filter, start, end);
-    events.push(...chunk);
+// Uses the Blockscout explorer API to get all ERC-721 transfers involving the account
+// for the NPM contract — one HTTP request, no block-range scanning needed.
+async function fetchNpmTransfers(account) {
+  const url =
+    `${EXPLORER_API}?module=account&action=tokennfttx` +
+    `&address=${account}&contractaddress=${NPM_ADDRESS}&sort=asc`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Blockscout API returned HTTP ${res.status}`);
+  const data = await res.json();
+  // status "0" with "No transactions found" is a valid empty result
+  if (data.status !== "1" && data.message !== "No transactions found") {
+    throw new Error(`Blockscout API error: ${data.message ?? JSON.stringify(data)}`);
   }
-  return events;
+  return data.result ?? [];
 }
 
 // Staked NFTs are owned by the gauge contract, not the user's address.
-// Strategy: find all tokenIds ever sent FROM the account via NPM Transfer events,
-// then check current ownership — tokens still held by another address are staked/deposited.
+// Strategy: ask Blockscout for all NPM token transfers involving the account,
+// find tokenIds sent FROM the account, then confirm via ownerOf that they're
+// still held by another address (i.e. currently staked, not returned or burned).
 async function checkStakedPositions(provider, account, npm) {
   console.log("\n=== Staked Positions ===");
 
-  let latestBlock;
+  let transfers;
   try {
-    latestBlock = await provider.getBlockNumber();
+    transfers = await fetchNpmTransfers(account);
   } catch (err) {
-    console.log(`  Warning: could not get block number: ${err.message}`);
+    console.log(`  Warning: ${err.message}`);
+    console.log(`  Check manually: ${EXPLORER}/address/${account}?tab=tokens`);
     return;
   }
 
-  // All transfers FROM this account, paginated in 9,000-block chunks
-  let sentEvents;
-  try {
-    const filter = npm.filters.Transfer(account);
-    process.stdout.write(`  Scanning ${latestBlock.toLocaleString()} blocks for transfers...`);
-    sentEvents = await queryFilterChunked(npm, filter, 0, latestBlock);
-    console.log(` found ${sentEvents.length} transfer(s).`);
-  } catch (err) {
-    console.log(`\n  Warning: could not query Transfer events: ${err.message}`);
-    return;
-  }
+  // Tokenids the account sent away
+  const sentIds = [
+    ...new Set(
+      transfers
+        .filter((t) => t.from.toLowerCase() === account.toLowerCase())
+        .map((t) => t.tokenID)
+    ),
+  ];
 
-  if (sentEvents.length === 0) {
+  if (sentIds.length === 0) {
     console.log("No staked positions found.");
     return;
   }
-
-  // Unique tokenIds sent by the account
-  const sentIds = [...new Set(sentEvents.map((e) => e.args.tokenId.toString()))];
 
   let totalFound = 0;
   for (const tokenIdStr of sentIds) {
@@ -363,11 +345,9 @@ async function checkStakedPositions(provider, account, npm) {
     try {
       currentOwner = await npm.ownerOf(tokenId);
     } catch {
-      // Token burned (ownerOf reverts)
-      continue;
+      continue; // burned
     }
-    // Skip tokens that have come back to the account (already shown as unstaked)
-    if (currentOwner.toLowerCase() === account.toLowerCase()) continue;
+    if (currentOwner.toLowerCase() === account.toLowerCase()) continue; // returned to account
 
     totalFound++;
     const shortOwner = `${currentOwner.slice(0, 10)}…`;
