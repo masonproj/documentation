@@ -10,6 +10,7 @@
 // Defaults to: 0xFC7e6c4b768534167d411a48505aa30F02b38439
 
 import { ethers } from "ethers";
+import { fileURLToPath } from "url";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -25,7 +26,7 @@ const RPCS = [
 
 const NPM_ADDRESS     = "0x509Bc221df2B83927c695FA0bb0f5B21053C874c";
 const FACTORY_ADDRESS = "0xBB24AF5c6fB88F1d191FA76055e30BF881BeEb79";
-const EXPLORER_API    = "https://explorer.mezo.org/api";
+const EXPLORER_API    = "https://explorer.mezo.org";
 
 const FEE_FROM_TICK_SPACING = {
   1: "0.01%", 10: "0.05%", 50: "0.05%",
@@ -102,7 +103,7 @@ const Q96 = 2n ** 96n;
 // Converts a tick to its sqrtPriceX96 representation (Q64.96 BigInt).
 // Uses a Q20 split to preserve float precision for realistic tick ranges
 // (covers sqrtRatio up to ~8.6e9, i.e., BTC prices up to ~$3 billion).
-function tickToSqrtPriceX96(tick) {
+export function tickToSqrtPriceX96(tick) {
   const sqrtRatio = Math.pow(1.0001, tick / 2);
   const Q20 = 1_048_576; // 2^20
   const scaled = sqrtRatio * Q20;
@@ -114,7 +115,7 @@ function tickToSqrtPriceX96(tick) {
 }
 
 // Returns token amounts for a position given its liquidity and price bounds.
-function calculateAmounts(liquidity, sqrtPriceX96, tickLower, tickUpper) {
+export function calculateAmounts(liquidity, sqrtPriceX96, tickLower, tickUpper) {
   if (liquidity === 0n) return { amount0: 0n, amount1: 0n };
 
   const sqrtA = tickToSqrtPriceX96(tickLower);
@@ -139,7 +140,7 @@ function calculateAmounts(liquidity, sqrtPriceX96, tickLower, tickUpper) {
 }
 
 // Formats a raw BigInt token amount with the given decimal places.
-function formatAmount(raw, decimals) {
+export function formatAmount(raw, decimals) {
   if (raw <= 0n) return "0";
   const divisor = 10n ** BigInt(decimals);
   const intPart = raw / divisor;
@@ -150,7 +151,7 @@ function formatAmount(raw, decimals) {
 
 // Returns price of token0 in terms of token1 as a human-readable string.
 // price_human = (sqrtPriceX96 / 2^96)^2 × 10^decimals0 / 10^decimals1
-function sqrtPriceX96ToPrice(sqrtPriceX96, decimals0, decimals1) {
+export function sqrtPriceX96ToPrice(sqrtPriceX96, decimals0, decimals1) {
   const adj0 = 10n ** BigInt(decimals0);
   const adj1 = 10n ** BigInt(decimals1);
   const num = sqrtPriceX96 * sqrtPriceX96 * adj0;
@@ -163,7 +164,7 @@ function sqrtPriceX96ToPrice(sqrtPriceX96, decimals0, decimals1) {
 }
 
 // Converts a tick to a human-readable price string.
-function tickToPrice(tick, decimals0, decimals1) {
+export function tickToPrice(tick, decimals0, decimals1) {
   const priceRaw = Math.pow(1.0001, tick);
   const adjusted = (priceRaw * 10 ** decimals0) / 10 ** decimals1;
   if (adjusted === 0) return "0";
@@ -292,20 +293,30 @@ async function readPositions(provider, account, npm) {
 
 // ─── Staked positions ─────────────────────────────────────────────────────────
 
-// Uses the Blockscout explorer API to get all ERC-721 transfers involving the account
-// for the NPM contract — one HTTP request, no block-range scanning needed.
+// Uses the Blockscout v2 API to get all ERC-721 transfers for the account from
+// the NPM contract. Follows next_page_params pagination until exhausted.
 async function fetchNpmTransfers(account) {
-  const url =
-    `${EXPLORER_API}?module=account&action=tokennfttx` +
-    `&address=${account}&contractaddress=${NPM_ADDRESS}&sort=asc`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Blockscout API returned HTTP ${res.status}`);
-  const data = await res.json();
-  // status "0" with "No transactions found" is a valid empty result
-  if (data.status !== "1" && data.message !== "No transactions found") {
-    throw new Error(`Blockscout API error: ${data.message ?? JSON.stringify(data)}`);
+  const base =
+    `${EXPLORER_API}/api/v2/addresses/${account}/token-transfers` +
+    `?type=ERC-721&token=${NPM_ADDRESS}`;
+  const transfers = [];
+  let url = base;
+  while (url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Blockscout API HTTP ${res.status}`);
+    const data = await res.json();
+    for (const item of data.items ?? []) {
+      transfers.push({
+        from:    item.from.hash,
+        to:      item.to.hash,
+        tokenID: item.total.token_id,
+      });
+    }
+    url = data.next_page_params
+      ? `${base}&${new URLSearchParams(data.next_page_params)}`
+      : null;
   }
-  return data.result ?? [];
+  return transfers;
 }
 
 // Staked NFTs are owned by the gauge contract, not the user's address.
@@ -381,7 +392,9 @@ async function main() {
   console.log("\nDone.");
 }
 
-main().catch((err) => {
-  console.error(`\nFatal: ${err.message}`);
-  process.exit(1);
-});
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error(`\nFatal: ${err.message}`);
+    process.exit(1);
+  });
+}
