@@ -49,7 +49,9 @@ const FEE_FROM_TICK_SPACING = {
 const NPM_ABI = [
   "function balanceOf(address owner) view returns (uint256)",
   "function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)",
+  "function ownerOf(uint256 tokenId) view returns (address)",
   "function positions(uint256 tokenId) view returns (uint96 nonce, address operator, address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)",
+  "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
 ];
 
 const FACTORY_ABI = [
@@ -309,51 +311,46 @@ async function readPositions(provider, account, npm) {
 
 // ─── Staked positions ─────────────────────────────────────────────────────────
 
-// Staked NFTs are owned by the gauge contract, not the user directly.
-// We discover them by querying Deposit events on each known gauge.
+// Staked NFTs are owned by the gauge contract, not the user's address.
+// Strategy: find all tokenIds ever sent FROM the account via NPM Transfer events,
+// then check current ownership — tokens still held by another address are staked/deposited.
 async function checkStakedPositions(provider, account, npm) {
   console.log("\n=== Staked Positions ===");
 
-  const factory = new ethers.Contract(FACTORY_ADDRESS, FACTORY_ABI, provider);
-  const gaugeFactory = new ethers.Contract(GAUGE_FACTORY_ADDRESS, GAUGE_FACTORY_ABI, provider);
+  // All transfers FROM this account
+  let sentEvents;
+  try {
+    const filter = npm.filters.Transfer(account);
+    sentEvents = await npm.queryFilter(filter, 0, "latest");
+  } catch (err) {
+    console.log(`  Warning: could not query Transfer events: ${err.message}`);
+    return;
+  }
+
+  if (sentEvents.length === 0) {
+    console.log("No staked positions found.");
+    return;
+  }
+
+  // Unique tokenIds sent by the account
+  const sentIds = [...new Set(sentEvents.map((e) => e.args.tokenId.toString()))];
 
   let totalFound = 0;
-
-  for (const { token0, token1, tickSpacing } of KNOWN_CL_POOLS) {
-    let poolAddress;
+  for (const tokenIdStr of sentIds) {
+    const tokenId = BigInt(tokenIdStr);
+    let currentOwner;
     try {
-      poolAddress = await factory.getPool(token0, token1, tickSpacing);
+      currentOwner = await npm.ownerOf(tokenId);
     } catch {
+      // Token burned (ownerOf reverts)
       continue;
     }
-    if (!poolAddress || poolAddress === ethers.ZeroAddress) continue;
+    // Skip tokens that have come back to the account (already shown as unstaked)
+    if (currentOwner.toLowerCase() === account.toLowerCase()) continue;
 
-    let gaugeAddress;
-    try {
-      gaugeAddress = await gaugeFactory.getGauge(poolAddress);
-    } catch {
-      continue;
-    }
-    if (!gaugeAddress || gaugeAddress === ethers.ZeroAddress) continue;
-
-    try {
-      const gauge = new ethers.Contract(gaugeAddress, GAUGE_ABI, provider);
-      const filter = gauge.filters.Deposit(account);
-      const events = await gauge.queryFilter(filter, 0, "latest");
-
-      const seen = new Set();
-      for (const evt of events) {
-        const tokenId = evt.args.tokenId;
-        const key = tokenId.toString();
-        if (!seen.has(key)) {
-          seen.add(key);
-          totalFound++;
-          await printPosition(provider, npm, tokenId, "staked");
-        }
-      }
-    } catch (err) {
-      console.log(`  Warning: could not query gauge ${gaugeAddress}: ${err.message}`);
-    }
+    totalFound++;
+    const shortOwner = `${currentOwner.slice(0, 10)}…`;
+    await printPosition(provider, npm, tokenId, `staked @ ${shortOwner}`);
   }
 
   if (totalFound === 0) {
